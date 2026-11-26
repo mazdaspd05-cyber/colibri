@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "hypothesis": "Decoding each int4 group once and reusing it across prompt rows is faster than unpacking the same nibbles on every row, and the per-row FMA order stays bit-identical.",
+  "commit": "a2d9e8174f6e9af228b8b97f7a1d14c344588710",
+  "model": "synthetic fmt=4 gs=64, S=32 I=2048 O=1024, not a checkpoint",
+  "command": "OMP_NUM_THREADS=1 ./tests/bench_i4g_blk (8 kernel calls per sample; tok_s is calls/second)",
+  "prompt_hash": "39adf11f9f120f0eb6cd0f9716ec7713841ba2a09f8847a23e1dde6000986e7a",
+  "hardware": {
+    "cpu": "Intel Xeon (KVM), 4 vCPU, AVX2+AVX-512; kernel is the AVX2 path",
+    "ram": "15 GiB, 1 NUMA node",
+    "storage": "not on the timed path (weights are in RAM)",
+    "os": "Linux 6.12.113+, gcc 13.3.0 -O3 -march=native"
+  },
+  "warmup_runs": 0,
+  "changed_variables": ["kernel"],
+  "baseline": {
+    "config": {"kernel": "per-row AVX2 unpack"},
+    "samples": {"tok_s": [169.49152542372883, 150.9433962264151, 170.5756929637527]},
+    "median_tok_s": 169.49152542372883,
+    "quality": {"method": "bit-exact vs per-row loop, 32768 outputs", "passed": true},
+    "evidence": {"uri": "docs/experiments/i4g-blocked-2026-11-26/raw.txt", "sha256": "d2d87fbebafe075c89853b804b3fe3b16ffc93c6ad73bdd5c5be31698d070d56"}
+  },
+  "trial": {
+    "config": {"kernel": "decode group once, reuse across rows"},
+    "samples": {"tok_s": [238.0952380952381, 190.9307875894988, 234.60410557184753]},
+    "median_tok_s": 234.60410557184753,
+    "quality": {"method": "bit-exact vs per-row loop, 32768 outputs", "passed": true},
+    "evidence": {"uri": "docs/experiments/i4g-blocked-2026-11-26/raw.txt", "sha256": "d2d87fbebafe075c89853b804b3fe3b16ffc93c6ad73bdd5c5be31698d070d56"}
+  },
+  "outcome": "improvement"
+}

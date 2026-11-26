@@ -1,0 +1,9 @@
+OMP_NUM_THREADS=1 ./tests/bench_i4g_blk
+shape S=32 I=2048 O=1024 gs=64, 8 calls per timed run
+third process (hottest):
+run 0  row 0.0472 s   blocked 0.0336 s   1.41x
+run 1  row 0.0530 s   blocked 0.0419 s   1.26x
+run 2  row 0.0469 s   blocked 0.0341 s   1.38x
+bit-exact 32768 outputs
+host: Linux 6.12.113+ gcc 13.3.0 -O3 -march=native (AVX2 path; this kernel has no AVX-512 arm)
+commit measured: a2d9e8174f6e9af228b8b97f7a1d14c344588710
