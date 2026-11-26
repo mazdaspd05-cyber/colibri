@@ -2606,6 +2606,15 @@ tests/bench_load_tq_peak_rss$(EXE): tests/bench_load_tq_peak_rss.c
 tests/test_st$(EXE): tests/test_st.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_willneed_plan$(EXE): tests/test_willneed_plan.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_reexec_affinity$(EXE): tests/test_reexec_affinity.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_mmap_populate$(EXE): tests/test_mmap_populate.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_st_mirror$(EXE): tests/test_st_mirror.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

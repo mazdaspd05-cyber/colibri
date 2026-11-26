@@ -60,9 +60,12 @@ cap when launched directly; explicit `OMP_NUM_THREADS` and the
 > Note (#471): exporting `OMP_PROC_BIND`/`OMP_PLACES` used to interact badly with
 > the engine's one-time OpenMP tuning re-exec on Linux — the re-exec'd image
 > inherited the first image's place-0 thread binding and the whole team landed on
-> one core (~20× slowdown). The engine now resets its affinity to all online CPUs
-> right before the re-exec, so explicit `OMP_*` pinning works as documented.
-> `COLI_OMP_TUNED=1` remains the escape hatch that skips the re-exec entirely.
+> one core (~20× slowdown). When those variables were already set at start, the
+> engine still restores every online CPU before the re-exec so the child's
+> constructor can bind from the full set. A mask that came from taskset or
+> systemd `CPUAffinity` (no `OMP_PROC_BIND`/`OMP_PLACES` of your own) is kept:
+> widening it used to discard the pin. `COLI_CPUS=0-3,8` installs that list
+> either way. `COLI_OMP_TUNED=1` remains the escape hatch that skips the re-exec.
 
 The re-exec binds the team with `OMP_PROC_BIND=close` and `OMP_PLACES=cores`, one place
 per core. Without the places libgomp makes one per hardware thread, and on a CPU that

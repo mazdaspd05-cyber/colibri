@@ -62,6 +62,8 @@
 #include <cpuid.h>                                /* hwinfo_emit: CPU brand string senza /proc */
 #endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
+#include "affinity.h"    /* re-exec keeps taskset/systemd pins; COLI_CPUS overrides */
+#include "mmap_io.h"     /* COLI_MMAP_IO: populate a mapped expert in one read */
 #include "cli_args.h"
 #include "oracle.h"
 #define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
@@ -3249,6 +3251,7 @@ static void embed_row(Model *m, int tok, float *x){
  * registrate con Metal (newBufferWithBytesNoCopy su pagine file-backed, come llama.cpp),
  * quindi la GPU legge gli stessi byte. Fallback allo slab path su disallineamento. */
 static int g_mmap=0;
+static int g_mmap_io=0;   /* COLI_MMAP_IO=1: populate mmap experts in one read, not a 4 KB fault loop */
 static struct { int fd; void *base; size_t len; } g_maps[512]; static int g_nmaps;
 static pthread_mutex_t g_map_mtx = PTHREAD_MUTEX_INITIALIZER;   /* expert_load e' OMP-parallel */
 /* forward decls: mem_should_wire/mem_wire live near pin_wire() further down, but
@@ -3585,14 +3588,23 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
              * residency. This is pread's I/O without the copy and without the slab. */
             for(int k=0;k<3;k++){
                 char *p=(char*)bw[k]+tw[k]->off; size_t n=(size_t)tw[k]->nbytes;
-#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
-                madvise((void*)((uintptr_t)p & ~16383UL), n+16384, MADV_WILLNEED);
-#endif
-                volatile char acc=0;
-                for(size_t i=0;i<n;i+=4096) acc+=p[i];
-                acc+=p[n-1]; (void)acc;
                 char *q=(char*)bq[k]+tq[k]->off; size_t nq=(size_t)tq[k]->nbytes;
-                for(size_t i=0;i<nq;i+=4096) acc+=q[i];
+                if(g_mmap_io){
+                    /* One populate per tensor, not a 4 KB fault. The kernel submits
+                     * the range at its own queue depth. The miss loop already runs
+                     * one expert per thread, so the active experts are in flight
+                     * together. Bytes are unchanged. */
+                    coli_mmap_populate(p, n);
+                    coli_mmap_populate(q, nq);
+                } else {
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+                    madvise((void*)((uintptr_t)p & ~16383UL), n+16384, MADV_WILLNEED);
+#endif
+                    volatile char acc=0;
+                    for(size_t i=0;i<n;i+=4096) acc+=p[i];
+                    acc+=p[n-1]; (void)acc;
+                    for(size_t i=0;i<nq;i+=4096) acc+=q[i];
+                }
                 /* mlock deliberately NOT done here: this fires for every expert_load call,
                  * including the transient VRAM-staging pass in pin_load (host copy loaded,
                  * uploaded to GPU, then "released" via expert_host_release -- which only
@@ -4808,6 +4820,10 @@ static void expert_host_ensure(Model *m, int layer, ESlot *s){
 
 /* prefetch asincrono dei pesi di un expert (e delle sue scale .qs): avvia il readahead
  * cosi' le letture sincrone successive trovano la page-cache calda.
+ * st_prefetch_rep hints the WHOLE tensor, in readahead-sized WILLNEED windows
+ * (Linux reads only one window per call). The calls return once queued, so the
+ * gate/up/down of this expert — and the next experts this loop walks — stay in
+ * flight together instead of stopping after the first 128 KB.
  * Sotto g_direct i PESI vengono letti con O_DIRECT (bypassa la page-cache, vedi
  * expert_load): il WILLNEED su di essi scalda pagine che la lettura di domanda non
  * consuma -> readahead sprecato sul disco, la risorsa piu' scarsa nello streaming.
@@ -4818,6 +4834,24 @@ static void expert_host_ensure(Model *m, int layer, ESlot *s){
  * is deterministic).
  * EN: under O_DIRECT the weights bypass the page cache, so their WILLNEED is wasted;
  * the .qs scales are always buffered, so keep theirs. Advisory hint -> output-preserving. */
+/* Prefill-only: the expert was a mmap miss. Mark its weight and scale pages
+ * cold (MADV_COLD) so a one-shot scan does not push the hot set out. No bytes
+ * change. fmt=4 is the grouped int4 the streaming experts use; other formats
+ * stay untouched here. */
+static void mmap_io_cold_expert(const ESlot *e){
+    if(!g_mmap_io || !g_mmap || !e || e->slab) return;
+    const QT *qt[3]={&e->g,&e->u,&e->d};
+    for(int k=0;k<3;k++){
+        const QT *t=qt[k];
+        if(t->fmt!=4 || t->gs<=0 || !t->q4 || !t->s) continue;
+        size_t wb=(size_t)t->O*((t->I+1)/2);
+        int ng=(t->I+t->gs-1)/t->gs;
+        size_t sb=(size_t)t->O*(size_t)ng*sizeof(float);
+        coli_mmap_cold(t->q4, wb);
+        coli_mmap_cold(t->s, sb);
+    }
+}
+
 static void expert_prefetch(Model *m, int layer, int eid){
     char nm[300]; int rep=expert_route(layer,eid);
     const char *suf[3]={"gate_proj.weight","up_proj.weight","down_proj.weight"};
@@ -7658,6 +7692,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 g_pq.x=xg; g_pq.S=nr; g_pq.I=D; g_pq.xq=xqg; g_pq.sx=sxg; g_pq.xsum=xsumg;
             }
             expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
+            /* A prefill scans far more experts than decode will reuse. Mark a
+             * miss just read from an mmap as cold so the page cache reclaims
+             * it ahead of experts that stay hot. Hits are left alone. */
+            if(S>1 && qof[j]>=0) mmap_io_cold_expert(e);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             double dt=now_s()-t0;m->t_emm+=dt;if(g_prof){m->t_ecpu+=dt;
@@ -14230,6 +14268,16 @@ int main(int argc, char **argv){
      * perdeva silenziosamente il tuning che un `./colibri` nudo riceve. Grazie a
      * @fredchu per averlo letto nel sorgente e detto chiaramente di non averlo
      * misurato (#707). */
+    /* Snapshot the bind the user exported BEFORE the setenv below. libgomp has
+     * already constructed, so a pre-set OMP_PROC_BIND/OMP_PLACES has narrowed
+     * THIS thread to place 0; a mask that is only taskset or systemd
+     * CPUAffinity has not. getenv's pointer would not survive setenv, the flag
+     * does. */
+    int user_omp_bind = (getenv("OMP_PROC_BIND") && getenv("OMP_PROC_BIND")[0])
+                     || (getenv("OMP_PLACES") && getenv("OMP_PLACES")[0]);
+#if !defined(__linux__) || !defined(CPU_SETSIZE)
+    (void)user_omp_bind;
+#endif
     if(!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE") &&
        !coli_env_on("COLI_CUDA") && !coli_env_on("COLI_METAL")){
         /* #707: the spin-wait knobs are measured HARMFUL on macOS / Apple
@@ -14276,24 +14324,20 @@ int main(int argc, char **argv){
         setenv("COLI_OMP_TUNED","1",1);
 #ifdef __linux__
         fprintf(stderr,"[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n");
-        /* #471: execv PRESERVES the CPU affinity mask. If the user exported
-         * OMP_PROC_BIND/OMP_PLACES, libgomp's constructor already bound THIS thread to
-         * place 0 (one core's SMT siblings) before main() ran; the re-exec'd image would
-         * inherit that 1-core mask, enumerate OMP_PLACES=cores inside it, and jail the
-         * whole team on one core (measured ~20x slowdown). Reset to all online CPUs so
-         * the fresh libgomp binds from the full set — the user's OMP_* env still wins. */
-        /* CPU_SETSIZE is only exposed when _GNU_SOURCE was defined before the first
-         * system header. The standalone engine build defines it at the top of this
-         * file so the reset is active where it matters; test TUs that #include this
-         * file after <assert.h>/<math.h> get it too late, so guard for them (a test
-         * never re-execs — skipping the reset there is harmless). */
+        /* execv keeps this thread's affinity mask. Do not widen a mask the
+         * operator set with taskset or systemd CPUAffinity: that pin is the
+         * whole point, and resetting it to every online CPU dropped it on the
+         * floor. COLI_CPUS=0-3,8 (taskset syntax) is an explicit mask and wins.
+         * The one case that still widens is a process started with
+         * OMP_PROC_BIND or OMP_PLACES already set (#471): libgomp bound THIS
+         * thread to place 0 before main, and the re-exec would jail the team
+         * on that place (~20x). Restoring every online CPU lets the child's
+         * constructor bind from the full set; the user's OMP_* values stay.
+         * CPU_SETSIZE exists only when _GNU_SOURCE preceded the first system
+         * header. This file defines it at the top; a test that includes the
+         * engine after another header skips the call, and a test never re-execs. */
 #ifdef CPU_SETSIZE
-        { cpu_set_t all; CPU_ZERO(&all);
-          long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-          if(ncpu > CPU_SETSIZE) ncpu = CPU_SETSIZE;
-          for(long i = 0; i < ncpu; i++) CPU_SET((int)i, &all);
-          if(sched_setaffinity(0, sizeof(all), &all) != 0)
-              perror("[OMP] sched_setaffinity pre-reexec (continuing)"); }
+        coli_affinity_before_reexec(getenv("COLI_CPUS"), user_omp_bind);
 #endif
         execv("/proc/self/exe", argv);         /* returns only on failure -> fall through and run untuned */
         perror("[OMP] execv self-reexec failed, running untuned");
@@ -14361,6 +14405,7 @@ int main(int argc, char **argv){
     g_drop = getenv("DROP")?1:0;
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
     g_mmap = getenv("COLI_MMAP")?atoi(getenv("COLI_MMAP")):0;
+    g_mmap_io = g_mmap && getenv("COLI_MMAP_IO") && atoi(getenv("COLI_MMAP_IO"));
     { const char *tr=getenv("TRUNK_RESIDENT_LAYERS");
       if(tr){ g_trunk_resident=atoi(tr);
         if(g_trunk_resident<0){ fprintf(stderr,"TRUNK_RESIDENT_LAYERS must be >= 0\n"); return 2; }
