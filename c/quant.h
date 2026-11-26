@@ -1761,4 +1761,122 @@ static void matmul_e8(float *y, const float *x, const uint8_t *q, const float *u
     }
 }
 
+/* Pair-layout grouped int4 x int8 activations (COLI_I8). Weights stay in the
+ * on-disk nibble order, so a COLI_MMAP view can be used without planarize.
+ * Per group: dot(unsigned nibble, int8 x) - 8*sum(x), times the group scale,
+ * one fmaf per group in ascending order. The int32 sum is exact, so the AVX2
+ * maddubs order matches the scalar sum. Not bit-identical to matmul_i4_grouped
+ * (int8 activations). Default off; colibri.c gates it. */
+static int32_t i4g_i8_dotu(const uint8_t *w, const int8_t *x, int base, int glen){
+    int32_t d=0; int i=0;
+#ifdef __AVX2__
+    if(!(base&1)){
+        const __m128i m4=_mm_set1_epi8(0x0F);
+        const __m256i ones=_mm256_set1_epi16(1);
+        __m256i acc=_mm256_setzero_si256();
+        for(; i+32<=glen; i+=32){
+            __m128i by=_mm_loadu_si128((const __m128i*)(w+((base+i)>>1)));
+            __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+            __m256i u=_mm256_set_m128i(_mm_unpackhi_epi8(lo,hi), _mm_unpacklo_epi8(lo,hi));
+            __m256i p=_mm256_maddubs_epi16(u, _mm256_loadu_si256((const __m256i*)(x+base+i)));
+            acc=_mm256_add_epi32(acc, _mm256_madd_epi16(p, ones));
+        }
+        d=hsum256_i32(acc);
+    }
+#endif
+    for(; i<glen; i++){
+        int a=base+i; uint8_t b=w[a>>1];
+        int u=(a&1)?(int)(b>>4):(int)(b&0xF);
+        d+=(int32_t)u*x[a];
+    }
+    return d;
+}
+#ifdef __AVX2__
+/* Whole group, four rows. The nibble unpack is paid once; each row keeps one
+ * int32 accumulator and is reduced once, not every 32 elements. */
+static void i4g_i8_group4(int32_t *d0, int32_t *d1, int32_t *d2, int32_t *d3,
+                          const uint8_t *w, int base, int glen,
+                          const int8_t *x0, const int8_t *x1, const int8_t *x2, const int8_t *x3){
+    const __m128i m4=_mm_set1_epi8(0x0F);
+    const __m256i ones=_mm256_set1_epi16(1);
+    __m256i a0=_mm256_setzero_si256(), a1=_mm256_setzero_si256();
+    __m256i a2=_mm256_setzero_si256(), a3=_mm256_setzero_si256();
+    int i=0;
+    for(; i+32<=glen; i+=32){
+        __m128i by=_mm_loadu_si128((const __m128i*)(w+((base+i)>>1)));
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m256i u=_mm256_set_m128i(_mm_unpackhi_epi8(lo,hi), _mm_unpacklo_epi8(lo,hi));
+        a0=_mm256_add_epi32(a0,_mm256_madd_epi16(_mm256_maddubs_epi16(u,_mm256_loadu_si256((const __m256i*)(x0+base+i))),ones));
+        a1=_mm256_add_epi32(a1,_mm256_madd_epi16(_mm256_maddubs_epi16(u,_mm256_loadu_si256((const __m256i*)(x1+base+i))),ones));
+        a2=_mm256_add_epi32(a2,_mm256_madd_epi16(_mm256_maddubs_epi16(u,_mm256_loadu_si256((const __m256i*)(x2+base+i))),ones));
+        a3=_mm256_add_epi32(a3,_mm256_madd_epi16(_mm256_maddubs_epi16(u,_mm256_loadu_si256((const __m256i*)(x3+base+i))),ones));
+    }
+    *d0=hsum256_i32(a0); *d1=hsum256_i32(a1); *d2=hsum256_i32(a2); *d3=hsum256_i32(a3);
+    for(; i<glen; i++){
+        int a=base+i; uint8_t b=w[a>>1];
+        int u=(a&1)?(int)(b>>4):(int)(b&0xF);
+        *d0+=(int32_t)u*x0[a]; *d1+=(int32_t)u*x1[a];
+        *d2+=(int32_t)u*x2[a]; *d3+=(int32_t)u*x3[a];
+    }
+}
+#endif
+static int32_t i4g_i8_sum(const int8_t *x, int n){ int32_t s=0; for(int i=0;i<n;i++) s+=x[i]; return s; }
+
+static void matmul_i4_grouped_i8(float *y, const float *x, const uint8_t *q4, const float *scale,
+                                 int S, int I, int O, int gs){
+    if(S<1||I<1||O<1||gs<1) return;
+    int rb=(I+1)/2, ng=(I+gs-1)/gs;
+    int8_t *xq; float *sx;
+    quant_scratch((size_t)S*(size_t)I, (size_t)S, &xq, &sx);
+    for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
+    /* One sum per (row, group), shared by every output row. Computing it inside
+     * the O loop repeated the same 64 adds O times and hid the maddubs. */
+    int32_t *xsg=(int32_t*)malloc((size_t)S*(size_t)ng*sizeof(int32_t));
+    if(!xsg){ fprintf(stderr,"OOM i8 group sums\n"); exit(1); }
+    for(int s=0;s<S;s++) for(int g=0; g*gs<I; g++){
+        int base=g*gs, glen=gs; if(base+glen>I) glen=I-base;
+        xsg[(int64_t)s*ng+g]=i4g_i8_sum(xq+(int64_t)s*I+base, glen);
+    }
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const float *scl=scale+(int64_t)o*ng;
+        int s=0;
+#ifdef __AVX2__
+        if(!(gs&1)){
+            for(; s+4<=S; s+=4){
+                const int8_t *x0=xq+(int64_t)s*I, *x1=x0+I, *x2=x1+I, *x3=x2+I;
+                float a0=0,a1=0,a2=0,a3=0;
+                for(int g=0; g*gs<I; g++){
+                    int base=g*gs, glen=gs; if(base+glen>I) glen=I-base;
+                    int32_t d0,d1,d2,d3;
+                    i4g_i8_group4(&d0,&d1,&d2,&d3, w, base, glen, x0,x1,x2,x3);
+                    int32_t s0=xsg[(int64_t)s*ng+g], s1=xsg[(int64_t)(s+1)*ng+g];
+                    int32_t s2=xsg[(int64_t)(s+2)*ng+g], s3=xsg[(int64_t)(s+3)*ng+g];
+                    float sc=scl[g];
+                    a0=i4p_fmaf((float)(d0-8*s0),sc,a0);
+                    a1=i4p_fmaf((float)(d1-8*s1),sc,a1);
+                    a2=i4p_fmaf((float)(d2-8*s2),sc,a2);
+                    a3=i4p_fmaf((float)(d3-8*s3),sc,a3);
+                }
+                y[(int64_t)s*O+o]=a0*sx[s];
+                y[(int64_t)(s+1)*O+o]=a1*sx[s+1];
+                y[(int64_t)(s+2)*O+o]=a2*sx[s+2];
+                y[(int64_t)(s+3)*O+o]=a3*sx[s+3];
+            }
+        }
+#endif
+        for(; s<S; s++){
+            const int8_t *xr=xq+(int64_t)s*I; float a=0;
+            for(int g=0; g*gs<I; g++){
+                int base=g*gs, glen=gs; if(base+glen>I) glen=I-base;
+                int32_t d=i4g_i8_dotu(w, xr, base, glen);
+                a=i4p_fmaf((float)(d-8*xsg[(int64_t)s*ng+g]), scl[g], a);
+            }
+            y[(int64_t)s*O+o]=a*sx[s];
+        }
+    }
+    free(xsg);
+}
+
 #endif /* COLI_QUANT_H */

@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "hypothesis": "An int8 maddubs dot on pair-layout grouped int4 is faster than the f32 unpack, at the cost of activation quantization. It must run on the bytes a COLI_MMAP view stores.",
+  "commit": "e2990f20e442aefb6e122d8998175c2aaaf8ccca",
+  "model": "synthetic fmt=4 gs=64, S=16 I=2048 O=512, not a checkpoint",
+  "command": "OMP_NUM_THREADS=1 ./tests/bench_i4g_i8 (S=16 row; tok_s is kernel calls/second, 8 calls per sample)",
+  "prompt_hash": "f39ae3724cd2c6b80e199858fe7f9afde961f81caca9476a95f3f3647c7bc3b1",
+  "hardware": {
+    "cpu": "Intel Xeon (KVM), 4 vCPU, AVX2+AVX-512; the timed kernel is the AVX2 maddubs path",
+    "ram": "15 GiB, 1 NUMA node",
+    "storage": "not on the timed path (weights are in RAM)",
+    "os": "Linux 6.12.113+, gcc 13.3.0 -O3 -march=native"
+  },
+  "warmup_runs": 0,
+  "changed_variables": ["COLI_I8"],
+  "baseline": {
+    "config": {"COLI_I8": "0"},
+    "samples": {"tok_s": [317.46031746031747, 316.20553359683794, 316.20553359683794]},
+    "median_tok_s": 316.20553359683794,
+    "quality": {"method": "test_i4g_i8 bit-exact vs scalar int32; f32 path is the existing kernel", "passed": true},
+    "evidence": {"uri": "docs/experiments/i4g-i8-2026-11-26/raw.txt", "sha256": "1748f1de955c01985df8b9334538e0a4bf83b2f4ae81a4e579effbba0a500cda"}
+  },
+  "trial": {
+    "config": {"COLI_I8": "1"},
+    "samples": {"tok_s": [544.21768707483, 544.21768707483, 506.3291139240506]},
+    "median_tok_s": 544.21768707483,
+    "quality": {"method": "test_i4g_i8 bit-exact vs scalar int32 reference", "passed": true},
+    "evidence": {"uri": "docs/experiments/i4g-i8-2026-11-26/raw.txt", "sha256": "1748f1de955c01985df8b9334538e0a4bf83b2f4ae81a4e579effbba0a500cda"}
+  },
+  "outcome": "improvement"
+}

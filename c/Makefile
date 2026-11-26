@@ -2880,6 +2880,12 @@ tests/test_idot_ssse3$(EXE): tests/test_idot.c colibri.c $(VK_OBJ)
 tests/test_int_kernel_exact_ssse3$(EXE): tests/test_int_kernel_exact.c
 	$(CC) $(CFLAGS) -mssse3 -mno-avx2 -mno-fma $< -o $@ $(LDFLAGS)
 
+tests/test_i4g_i8$(EXE): tests/test_i4g_i8.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/bench_i4g_i8$(EXE): tests/bench_i4g_i8.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_HAVE_GROUPED_PAIR $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
