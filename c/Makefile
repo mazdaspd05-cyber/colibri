@@ -3775,6 +3775,9 @@ tests/bench_idot$(EXE): tests/bench_idot.c colibri.c $(VK_OBJ)
 
 # bench_i4p_gidot: microbenchmark (per-row vs multi-row/AMX K1b grouped planar IDOT), NOT a test gate.
 # Build on demand: make tests/bench_i4p_gidot ARCH=native
+tests/bench_i4g_blk$(EXE): tests/bench_i4g_blk.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 tests/bench_i4p_gidot$(EXE): tests/bench_i4p_gidot.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 

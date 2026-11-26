@@ -164,11 +164,134 @@ static inline float i4g_step1(float a, float x0, float w0, float sc){
 }
 #endif
 
+#ifdef __AVX2__
+/* Decode one group whose first element is even (gs even) into dst[0..glen).
+ * The vector prefix is the per-row AVX2 unpack, stored; the tail is the scalar
+ * nibble. Reusing dst across prompt rows does not change a single product. */
+static void i4g_decode_avx2(const uint8_t *w, int base, int glen, float *dst){
+    const __m128i m4=_mm_set1_epi8(0x0F);
+    const __m256i b8=_mm256_set1_epi32(8);
+    int i=0;
+    for(; i+16<=glen; i+=16){
+        __m128i by=_mm_loadl_epi64((const __m128i*)(w+((base+i)>>1)));
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i nib=_mm_unpacklo_epi8(lo,hi);
+        __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
+        __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
+        _mm256_storeu_ps(dst+i, w0);
+        _mm256_storeu_ps(dst+i+8, w1);
+    }
+    for(; i<glen; i++){
+        uint8_t byte=w[(base+i)>>1];
+        int nib=((base+i)&1) ? (int)(byte>>4) : (int)(byte&0xF);
+        dst[i]=(float)(nib-8);
+    }
+}
+/* One row, one group: the per-row loop's FMA order, then its scalar tail. */
+static void i4g_fma_row(float *a, const float *xs, const float *wbuf, int base, int glen, float sc){
+    int vec=glen&~15;
+    __m256 acc=_mm256_setzero_ps();
+    int i=0;
+    for(; i<vec; i+=16){
+        __m256 w0=_mm256_loadu_ps(wbuf+i), w1=_mm256_loadu_ps(wbuf+i+8);
+        acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+base+i), w0, acc);
+        acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+base+i+8), w1, acc);
+    }
+    *a=fmaf(hsum256(acc), sc, *a);
+    for(; i<glen; i+=2){
+        if(i+1<glen) *a=i4g_step2(*a, xs[base+i], wbuf[i], xs[base+i+1], wbuf[i+1], sc);
+        else *a=i4g_step1(*a, xs[base+i], wbuf[i], sc);
+    }
+}
+/* Four rows, one decoded group. Each row's chain matches i4g_fma_row. */
+static void i4g_fma4(float *a0, float *a1, float *a2, float *a3,
+                     const float *x0, const float *x1, const float *x2, const float *x3,
+                     const float *wbuf, int base, int glen, float sc){
+    int vec=glen&~15;
+    __m256 c0=_mm256_setzero_ps(), c1=_mm256_setzero_ps(), c2=_mm256_setzero_ps(), c3=_mm256_setzero_ps();
+    int i=0;
+    for(; i<vec; i+=16){
+        __m256 w0=_mm256_loadu_ps(wbuf+i), w1=_mm256_loadu_ps(wbuf+i+8);
+        c0=_mm256_fmadd_ps(_mm256_loadu_ps(x0+base+i), w0, c0);
+        c0=_mm256_fmadd_ps(_mm256_loadu_ps(x0+base+i+8), w1, c0);
+        c1=_mm256_fmadd_ps(_mm256_loadu_ps(x1+base+i), w0, c1);
+        c1=_mm256_fmadd_ps(_mm256_loadu_ps(x1+base+i+8), w1, c1);
+        c2=_mm256_fmadd_ps(_mm256_loadu_ps(x2+base+i), w0, c2);
+        c2=_mm256_fmadd_ps(_mm256_loadu_ps(x2+base+i+8), w1, c2);
+        c3=_mm256_fmadd_ps(_mm256_loadu_ps(x3+base+i), w0, c3);
+        c3=_mm256_fmadd_ps(_mm256_loadu_ps(x3+base+i+8), w1, c3);
+    }
+    *a0=fmaf(hsum256(c0), sc, *a0);
+    *a1=fmaf(hsum256(c1), sc, *a1);
+    *a2=fmaf(hsum256(c2), sc, *a2);
+    *a3=fmaf(hsum256(c3), sc, *a3);
+    for(; i<glen; i+=2){
+        if(i+1<glen){
+            *a0=i4g_step2(*a0, x0[base+i], wbuf[i], x0[base+i+1], wbuf[i+1], sc);
+            *a1=i4g_step2(*a1, x1[base+i], wbuf[i], x1[base+i+1], wbuf[i+1], sc);
+            *a2=i4g_step2(*a2, x2[base+i], wbuf[i], x2[base+i+1], wbuf[i+1], sc);
+            *a3=i4g_step2(*a3, x3[base+i], wbuf[i], x3[base+i+1], wbuf[i+1], sc);
+        }else{
+            *a0=i4g_step1(*a0, x0[base+i], wbuf[i], sc);
+            *a1=i4g_step1(*a1, x1[base+i], wbuf[i], sc);
+            *a2=i4g_step1(*a2, x2[base+i], wbuf[i], sc);
+            *a3=i4g_step1(*a3, x3[base+i], wbuf[i], sc);
+        }
+    }
+}
+/* S>=4, gs even. Each weight group is unpacked once and reused across every
+ * prompt row. Rows are taken four at a time so four independent FMA chains
+ * share that unpack. A row's group partial is still one hsum and one fmaf,
+ * then the same scalar tail, so the bits match the per-row loop. */
+static void matmul_i4_grouped_avx2_blk(float *y, const float *x, const uint8_t *q4, const float *scale,
+                                       int S, int I, int O, int gs, int o0){
+    int rb=(I+1)/2, ng=(I+gs-1)/gs;
+    #pragma omp parallel
+    {
+        float wbuf[512];   /* caller only enters when gs<=512 */
+        #pragma omp for schedule(static)
+        for(int o=o0;o<O;o++){
+            const uint8_t *w=q4+(int64_t)o*rb;
+            const float *scl=scale+(int64_t)o*ng;
+            /* Tile of 64 prompt rows: one decode of each group feeds every row
+             * in the tile. Each row still does its own ascending-group fmaf. */
+            for(int s0=0; s0<S; s0+=64){
+                int sn=S-s0<64?S-s0:64;
+                float as[64]; for(int i=0;i<sn;i++) as[i]=0;
+                for(int g=0; g*gs<I; g++){
+                    int base=g*gs, glen=gs; if(base+glen>I) glen=I-base;
+                    float sc=scl[g];
+                    i4g_decode_avx2(w, base, glen, wbuf);
+                    int s=0;
+                    for(; s+4<=sn; s+=4){
+                        const float *x0=x+(int64_t)(s0+s)*I;
+                        i4g_fma4(&as[s],&as[s+1],&as[s+2],&as[s+3],
+                                 x0,x0+I,x0+2*I,x0+3*I, wbuf, base, glen, sc);
+                    }
+                    for(; s<sn; s++)
+                        i4g_fma_row(&as[s], x+(int64_t)(s0+s)*I, wbuf, base, glen, sc);
+                }
+                for(int s=0;s<sn;s++) y[(int64_t)(s0+s)*O+o]=as[s];
+            }
+        }
+    }
+}
+#endif
+
 /* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){
     int rb=(I+1)/2; int ng=(I+gs-1)/gs;
     int o0=0;
+#ifdef __AVX2__
+    /* Four-row reuse of one decoded group. gs>512 keeps the per-row loop
+     * (the decode buffer is 512 floats). Odd gs can start a group on a high
+     * nibble; that stays on the per-row loop too. */
+    if(S>=4 && gs>0 && gs<=512 && !(gs&1)){
+        matmul_i4_grouped_avx2_blk(y,x,q4,scale,S,I,O,gs,0);
+        return;
+    }
+#endif
 #if defined(__SSE4_1__) && !defined(__AVX2__)
     /* Even group sizes keep every group start on a low-nibble boundary. */
     if(!(gs&1)){
