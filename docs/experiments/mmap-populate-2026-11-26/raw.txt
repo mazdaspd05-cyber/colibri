@@ -1,0 +1,6 @@
+host: Linux 6.12.113+ virtio /dev/vdc ext4
+file: 256 MiB, drop_caches before each run
+touch4k MB/s: 3879.56 2209.29 3969.37
+populate MB/s: 4208.37 3968.98 4125.88
+command: /tmp/bench_pop2 0|1 after `echo 3 > /proc/sys/vm/drop_caches`
+commit: 93d39f3f23f5e3e2dbfac234fe0f7cd60fece9fa

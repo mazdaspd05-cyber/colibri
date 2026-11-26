@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "hypothesis": "MADV_POPULATE_READ of a cold 256 MiB mapping reads faster than a serial 4 KB fault loop, because the kernel can queue the range instead of one page at a time.",
+  "commit": "93d39f3f23f5e3e2dbfac234fe0f7cd60fece9fa",
+  "model": "synthetic 256 MiB file, not a checkpoint",
+  "command": "drop_caches; /tmp/bench_pop2 0 (4 KB touch) vs 1 (MADV_POPULATE_READ); throughput is MB/s stored in tok_s",
+  "prompt_hash": "9a6d23e03ecf54eb0e7cda33bc27f5ac0632872752075c81317cdb622a2ed751",
+  "hardware": {
+    "cpu": "Intel Xeon (KVM), 4 vCPU, AVX2+AVX-512",
+    "ram": "15 GiB, 1 NUMA node",
+    "storage": "virtio /dev/vdc 256G ext4 (ROTA reported 1); page cache dropped before each run",
+    "os": "Linux 6.12.113+, gcc 13.3.0"
+  },
+  "warmup_runs": 1,
+  "changed_variables": ["COLI_MMAP_IO"],
+  "baseline": {
+    "config": {"COLI_MMAP_IO": "0"},
+    "samples": {"tok_s": [3879.56, 2209.29, 3969.37]},
+    "median_tok_s": 3879.56,
+    "quality": {"method": "byte unchanged; test_mmap_populate checks the first pages", "passed": true},
+    "evidence": {"uri": "docs/experiments/mmap-populate-2026-11-26/raw.txt", "sha256": "1e1337681186157df9b521b9341c8c0cfba41d8b7e202ad7d6a26fdc784eea12"}
+  },
+  "trial": {
+    "config": {"COLI_MMAP_IO": "1"},
+    "samples": {"tok_s": [4208.37, 3968.98, 4125.88]},
+    "median_tok_s": 4125.88,
+    "quality": {"method": "byte unchanged; test_mmap_populate checks the first pages", "passed": true},
+    "evidence": {"uri": "docs/experiments/mmap-populate-2026-11-26/raw.txt", "sha256": "1e1337681186157df9b521b9341c8c0cfba41d8b7e202ad7d6a26fdc784eea12"}
+  },
+  "outcome": "improvement"
+}
