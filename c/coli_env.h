@@ -299,6 +299,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_GROUP_ASYNC",                 CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_HEAD_PIN_MIN", CE_STR, CE_QWEN38, 0, NULL},
     {"COLI_HITS_LIVE", CE_STR, CE_QWEN38, 0, NULL},
+    {"COLI_I8",                          CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_IMG_ACT8", CE_BOOL, CE_QWENIMAGE, 0, NULL},
     {"COLI_IMG_BITS", CE_INT, CE_QWENIMAGE, 0, NULL},
     {"COLI_IMG_LOAD_THREADS", CE_INT, CE_QWENIMAGE, 0, NULL},

@@ -681,6 +681,7 @@ static inline int spec_pinned(void){ return g_spec_pin && g_spec_live; }
 
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot);
 static void matmul_qt(float *y, const float *x, QT *w, int S){ matmul_qt_ex(y,x,w,S,1); }
+static int coli_i8_on(void);   /* COLI_I8=1, defined with the other IDOT gates */
 
 /* fmt=4 fused gate+up (defined later, after the quant kernels) */
 static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
@@ -689,6 +690,14 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
                                     int S, int I, int O, int gs);
 
 static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
+    /* COLI_I8: pair-layout grouped int4, the bytes COLI_MMAP stores. The f32
+     * fused pair below would skip it at S==1. */
+    if(coli_i8_on() && wg->fmt==4 && !wg->planar && wu->fmt==4 && !wu->planar
+       && wg->I==wu->I && wg->O==wu->O && wg->gs==wu->gs && wg->gs>0){
+        matmul_i4_grouped_i8(g,x,wg->q4,wg->s,S,wg->I,wg->O,wg->gs);
+        matmul_i4_grouped_i8(u,x,wu->q4,wu->s,S,wu->I,wu->O,wu->gs);
+        return;
+    }
     if(!g_no_fused_pair&&!spec_pinned()&&S==1&&wg->fmt==2&&!wg->planar&&!wu->planar&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
         matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
     else if(!g_no_fused_pair&&S==1&&wg->fmt==4&&!wg->planar&&!wu->planar&&wu->fmt==4&&wg->I==wu->I&&wg->O==wu->O&&wg->gs==wu->gs)
@@ -1301,6 +1310,19 @@ static _Atomic long g_planar_n;   /* tensori planarizzati (telemetria una-tantum
  * (attivazioni int8): resta 0 finche' l'ablazione non benedice un default.
  * EN: opt-in grouped IDOT for fmt=4; int8 activations, awaiting ablation. */
 static int g_idot_gs=-1;
+/* COLI_I8=1: int8 activations against grouped int4 AS STORED (pair nibbles,
+ * not the planar repack). IDOT_GS=1 refuses COLI_MMAP because planarize will
+ * not write a read-only mapping, and attention projections pass allow_idot=0.
+ * This flag is off unless set. It is not bit-identical to the f32 kernel. */
+static int g_coli_i8=-1;
+static int coli_i8_on(void){
+    if(g_coli_i8<0){
+        const char *e=getenv("COLI_I8");
+        g_coli_i8=(e&&atoi(e))?1:0;
+        if(g_coli_i8) fprintf(stderr,"[I8] pair-layout grouped int8 matmul on (COLI_I8=1, not bit-exact)\n");
+    }
+    return g_coli_i8;
+}
 static int idot_gs_on(void){
     if(g_idot_gs<0){ const char *e=getenv("IDOT_GS"); g_idot_gs=(e&&atoi(e))?1:0;
         if(g_idot_gs&&!planar_on()) g_idot_gs=0;   /* richiede la famiglia planare */
@@ -1504,10 +1526,11 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
             matmul_i4p_grouped_idot(y,xq,sx,xsg,w->q4,w->s,S,I,w->O,w->gs);
             return;
         }
+        if(coli_i8_on()){ matmul_i4_grouped_i8(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return; }
         matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return;
     }
     if(w->fmt==6){ matmul_e8(y,x,w->q4,NULL,S,w->I,w->O); return; }   /* scales live in-block */
-    if(allow_idot && g_idot && (w->fmt==1 || (w->fmt==2 && (spec_pinned() ? g_i4s<=1 : S>=g_i4s)))){
+    if((allow_idot || coli_i8_on()) && g_idot && (w->fmt==1 || (w->fmt==2 && (spec_pinned() ? g_i4s<=1 : S>=g_i4s)))){
         int I=w->I; int8_t *xq; float *sx;
         if(g_pq.x==x && g_pq.S==S && g_pq.I==I){
             /* righe gia' quantizzate una volta dal layer (vedi g_pq sopra)
