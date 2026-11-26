@@ -4808,6 +4808,10 @@ static void expert_host_ensure(Model *m, int layer, ESlot *s){
 
 /* prefetch asincrono dei pesi di un expert (e delle sue scale .qs): avvia il readahead
  * cosi' le letture sincrone successive trovano la page-cache calda.
+ * st_prefetch_rep hints the WHOLE tensor, in readahead-sized WILLNEED windows
+ * (Linux reads only one window per call). The calls return once queued, so the
+ * gate/up/down of this expert — and the next experts this loop walks — stay in
+ * flight together instead of stopping after the first 128 KB.
  * Sotto g_direct i PESI vengono letti con O_DIRECT (bypassa la page-cache, vedi
  * expert_load): il WILLNEED su di essi scalda pagine che la lettura di domanda non
  * consuma -> readahead sprecato sul disco, la risorsa piu' scarsa nello streaming.

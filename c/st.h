@@ -19,6 +19,9 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/sysmacros.h>   /* major/minor: read_ahead_kb of the tensor's block device */
+#endif
 #include "json.h"
 #include "compat.h"
 #include "load_fail.h"
@@ -1160,13 +1163,99 @@ static void st_die_missing(shards *S, const char *name) {
     exit(1);
 }
 
+/* Split [off, off+len) into `chunk`-byte WILLNEED windows.
+ * Returns the number of windows, or -1 if the arguments cannot describe a range.
+ * out_off/out_len may be NULL (count only). At most `maxn` windows are written;
+ * the return value is still the full count, so a short buffer is detectable.
+ * Linux caps one POSIX_FADV_WILLNEED at the device readahead (force_page_cache_ra
+ * clamps to max(bdi->io_pages, ra->ra_pages); 128 KiB on the NVMe this was measured
+ * on, llama.cpp #32515). A 7 MB expert hinted in one call therefore warms only the
+ * first window — iostat showed ~118 KB reads. The windows below are contiguous and
+ * cover the range exactly, including a short tail. */
+static int st_willneed_plan(int64_t off, int64_t len, int64_t chunk,
+                            int64_t *out_off, int64_t *out_len, int maxn) {
+    if (chunk <= 0 || len < 0 || off < 0 || maxn < 0) return -1;
+    if (len == 0) return 0;
+    if (len / chunk > 10000000) return -1;          /* hostile length: refuse, don't loop */
+    int64_t n64 = (len + chunk - 1) / chunk;
+    int n = (int)n64;
+    if (out_off && out_len) {
+        int w = n < maxn ? n : maxn;
+        for (int i = 0; i < w; i++) {
+            int64_t start = (int64_t)i * chunk;
+            int64_t step = chunk;
+            if (start + step > len) step = len - start;
+            out_off[i] = off + start;
+            out_len[i] = step;
+        }
+    }
+    return n;
+}
+
+/* Device readahead in bytes, cached per process. Linux publishes it as
+ * /sys/dev/block/<maj>:<min>/queue/read_ahead_kb. Anything else (or a read
+ * that fails) uses 128 KiB, the cap llama.cpp #32515 hit and the value this
+ * kernel's virtio disks report. Smaller than the real cap is still correct:
+ * each call then stays inside the window the kernel will actually read. */
+static long st_willneed_chunk_bytes(int fd) {
+    static long cached;
+    if (cached > 0) return cached;
+    long ra = 128 * 1024;
+#if defined(__linux__)
+    struct stat sb;
+    if (fd >= 0 && fstat(fd, &sb) == 0) {
+        unsigned maj = (unsigned)major(sb.st_dev);
+        unsigned mino = (unsigned)minor(sb.st_dev);
+        char path[80];
+        snprintf(path, sizeof path, "/sys/dev/block/%u:%u/queue/read_ahead_kb", maj, mino);
+        FILE *f = fopen(path, "re");
+        if (f) {
+            long kb = 0;
+            if (fscanf(f, "%ld", &kb) == 1 && kb >= 4 && kb <= (1L << 20))
+                ra = kb * 1024;
+            fclose(f);
+        }
+    }
+#else
+    (void)fd;
+#endif
+    cached = ra;
+    return ra;
+}
+
+/* POSIX_FADV_WILLNEED over the whole byte range. On Linux one call reads at most
+ * one readahead window, so this issues the plan's windows back to back: the calls
+ * return as soon as the kernel has queued them, and several tensors (the expert's
+ * gate/up/down, then the next experts expert_prefetch walks) stay in flight
+ * together. Other platforms keep a single call — Windows schedules one bounded
+ * worker per hint and drops hints past COMPAT_PREFETCH_JOBS, so chunking there
+ * would throw the tail away. */
+static void st_fadvise_willneed(int fd, off_t off, off_t len) {
+    if (fd < 0 || len <= 0) return;
+#if defined(__linux__)
+    long chunk = st_willneed_chunk_bytes(fd);
+    if (chunk < 4096) chunk = 128 * 1024;
+    int n = st_willneed_plan((int64_t)off, (int64_t)len, chunk, NULL, NULL, 0);
+    if (n < 0) return;
+    for (int i = 0; i < n; i++) {
+        int64_t start = (int64_t)i * chunk;
+        int64_t step = chunk;
+        if (start + step > (int64_t)len) step = (int64_t)len - start;
+        posix_fadvise(fd, off + (off_t)start, (off_t)step, POSIX_FADV_WILLNEED);
+    }
+#else
+    posix_fadvise(fd, off, len, POSIX_FADV_WILLNEED);
+#endif
+}
+
 /* prefetch ASINCRONO: dice al kernel di iniziare a leggere le pagine del tensore in
  * background (readahead). Serve a sovrapporre l'I/O degli expert col calcolo: si
  * prefetcha tutto il set di expert di un layer, poi le pread sincrone trovano la cache
- * gia' calda. No-op se il tensore non esiste (es. il primo .qs prima della lettura). */
+ * gia' calda. No-op se il tensore non esiste (es. il primo .qs prima della lettura).
+ * The hint covers the whole tensor, not the first readahead window (st_fadvise_willneed). */
 static void st_prefetch(shards *S, const char *name) {
     st_tensor *t = st_find(S, name);
-    if (t) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
+    if (t) st_fadvise_willneed(t->fd, (off_t)t->off, (off_t)t->nbytes);
 }
 
 /* like st_prefetch, but on replica `rep`'s drive: the WILLNEED must warm the
@@ -1176,7 +1265,7 @@ static void st_prefetch_rep(shards *S, const char *name, int rep) {
     if (!t) return;
     int fd = st_fd_rep(S, t->fd, rep);
     if (fd < 0) fd = t->fd;
-    posix_fadvise(fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
+    st_fadvise_willneed(fd, (off_t)t->off, (off_t)t->nbytes);
 }
 
 /* legge un tensore in un buffer float32 fornito dal chiamante (numel float).
