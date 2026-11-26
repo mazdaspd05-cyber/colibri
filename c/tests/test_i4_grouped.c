@@ -248,6 +248,35 @@ static int check_rows4_unpack(void){
 }
 #endif
 
+/* S>=4 takes the blocked AVX2 path. Each of its rows must match a lone S=1
+ * call, which stays on the per-row loop. That is the bit-exact contract. */
+static int check_blocked_exact(const char *name, int S, int I, int O, int gs){
+    int rb=(I+1)/2, ng=(I+gs-1)/gs;
+    uint8_t *q4=malloc((size_t)O*rb);
+    float *scale=malloc((size_t)O*ng*sizeof(float));
+    float *x=malloc((size_t)S*I*sizeof(float));
+    float *y=malloc((size_t)S*O*sizeof(float));
+    float *y1=malloc((size_t)O*sizeof(float));
+    if(!q4||!scale||!x||!y||!y1){ fprintf(stderr,"%s: OOM\n",name); return 1; }
+    for(size_t i=0;i<(size_t)O*rb;i++) q4[i]=(uint8_t)(xr()&0xFF);
+    for(int i=0;i<O*ng;i++) scale[i]=frand();
+    for(int i=0;i<S*I;i++) x[i]=frand();
+    matmul_i4_grouped(y,x,q4,scale,S,I,O,gs);
+    int bad=0;
+    for(int s=0;s<S;s++){
+        matmul_i4_grouped(y1, x+(int64_t)s*I, q4, scale, 1, I, O, gs);
+        for(int o=0;o<O;o++) if(y[(int64_t)s*O+o]!=y1[o]){
+            if(bad<3) fprintf(stderr,"%s: row %d col %d blocked %.9g single %.9g\n",
+                              name,s,o,(double)y[(int64_t)s*O+o],(double)y1[o]);
+            bad++;
+        }
+    }
+    free(q4);free(scale);free(x);free(y);free(y1);
+    if(bad){ fprintf(stderr,"%s: FAIL (%d)\n",name,bad); return 1; }
+    printf("  %-42s ok (S=%d bit-exact vs S=1)\n", name, S);
+    return 0;
+}
+
 int main(void){
     int fail=0;
     printf("test_i4_grouped: matmul_i4_grouped vs plain-C dequant reference\n");
@@ -277,6 +306,10 @@ int main(void){
 
     /* batch: S>1 exercises the per-s inner loop against a shared scale row */
     fail|=check("gs=64, batch S=8",                   8, 320, 6, 64, 0);
+    fail|=check_blocked_exact("blocked vs S=1, gs=64 S=8", 8, 320, 6, 64);
+    fail|=check_blocked_exact("blocked vs S=1, S=5 tail",  5, 200, 4, 64);
+    fail|=check_blocked_exact("blocked vs S=1, odd I",     4, 201, 3, 64);
+    fail|=check_blocked_exact("blocked vs S=1, gs=128",    7, 256, 4, 128);
     fail|=check("one-byte rows, odd I=1",             1,   1, 4, 2, 0);
 
 #ifdef COLI_HAVE_GROUPED_PAIR
