@@ -5494,6 +5494,8 @@ static void attention_rows_ml4(Model *m, Layer *l, int layer, float *x, int S, i
     free(Q); free(ctx); free(comp);
     m->t_attn += now_s()-ta0;
 }
+/* Prefill scores and the value mix. n<64 stays scalar (glm_tiny). See attn_simd.h. */
+#include "attn_simd.h"
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                            KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
@@ -6075,10 +6077,25 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                  * is accepted here — softmax downstream softens the rounding flip. */
                 int i=0;
 #if defined(__AVX2__)
-                __m256 acc=_mm256_setzero_ps();
-                for(;i+8<=kvl;i+=8)
-                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(qabs+i), _mm256_loadu_ps(Lt+i), acc);
-                a=hsum256(acc);
+                if(kvl>=64){
+                    int j=0;
+                    __m256 a0=_mm256_setzero_ps(), a1=_mm256_setzero_ps(), a2=_mm256_setzero_ps(), a3=_mm256_setzero_ps();
+                    for(; j+32<=kvl; j+=32){
+                        a0=_mm256_fmadd_ps(_mm256_loadu_ps(qabs+j),    _mm256_loadu_ps(Lt+j),    a0);
+                        a1=_mm256_fmadd_ps(_mm256_loadu_ps(qabs+j+8),  _mm256_loadu_ps(Lt+j+8),  a1);
+                        a2=_mm256_fmadd_ps(_mm256_loadu_ps(qabs+j+16), _mm256_loadu_ps(Lt+j+16), a2);
+                        a3=_mm256_fmadd_ps(_mm256_loadu_ps(qabs+j+24), _mm256_loadu_ps(Lt+j+24), a3);
+                    }
+                    __m256 acc=_mm256_add_ps(_mm256_add_ps(a0,a1), _mm256_add_ps(a2,a3));
+                    for(; j+8<=kvl; j+=8)
+                        acc=_mm256_fmadd_ps(_mm256_loadu_ps(qabs+j), _mm256_loadu_ps(Lt+j), acc);
+                    a=hsum256(acc); i=j;
+                } else {
+                    __m256 acc=_mm256_setzero_ps();
+                    for(;i+8<=kvl;i+=8)
+                        acc=_mm256_fmadd_ps(_mm256_loadu_ps(qabs+i), _mm256_loadu_ps(Lt+i), acc);
+                    a=hsum256(acc);
+                }
 #elif defined(__ARM_NEON)
                 float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
                 for(;i+8<=kvl;i+=8){
@@ -6087,7 +6104,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 a=vaddvq_f32(vaddq_f32(ac0,ac1));
 #endif
                 for(;i<kvl;i++) a+=qabs[i]*Lt[i];
-                for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+                a+=attn_dot(qr, kr, c->qk_rope);
                 }
                 }
                 sc[jj]=a*c->attn_scale;
@@ -6233,7 +6250,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 float mrun=st[0], lrun=st[1];
                 for(int64_t jj=0;jj<jn;jj++){
                     const float *kn=kvb_tile+jj*kvb_dim+(int64_t)h*(c->qk_nope+vh);
-                    float a=0; for(int d=0;d<c->qk_nope;d++) a+=qp[d]*kn[d];
+                    float a=attn_dot(qp, kn, c->qk_nope);
                     if(g_tq){
                         float Rf[512];
                         coli_kvq_dequant_row(coli_kv_row8(m->Rc8[layer],t0+jj,coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec)),
@@ -6248,17 +6265,17 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                         for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kv16_to(kr[d]);
                     } else {
                         const float *kr=m->Rc[layer]+(t0+jj)*c->qk_rope;
-                        for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+                        a+=attn_dot(qr, kr, c->qk_rope);
                     }
                     a*=c->attn_scale;
                     const float *vv=kvb_tile+jj*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
                     if(a>mrun){
                         float rs=expf(mrun-a);
-                        lrun*=rs; for(int d=0;d<vh;d++) cx[d]*=rs;
+                        lrun*=rs; attn_scale(cx, rs, vh);
                         mrun=a;
                     }
                     float w=expf(a-mrun);
-                    lrun+=w; for(int d=0;d<vh;d++) cx[d]+=w*vv[d];
+                    lrun+=w; attn_axpy(cx, w, vv, vh);
                 }
                 st[0]=mrun; st[1]=lrun;
             }
@@ -6375,7 +6392,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
             int64_t ti = kvb_map ? (int64_t)kvb_map[t-stL] : (int64_t)t;   /* gathered vs absolute row */
             const float *kn=kvb_all+ti*kvb_dim+(int64_t)h*(c->qk_nope+vh);
-            float a=0; for(int d=0;d<c->qk_nope;d++) a+=qp[d]*kn[d];
+            float a=attn_dot(qp, kn, c->qk_nope);
             if(g_tq){
                 float Rf[512];
                 coli_kvq_dequant_row(coli_kv_row8(m->Rc8[layer],t,coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec)), m->Rsc[layer][t], Rf, c->qk_rope, g_tq_bits, g_tq_codec);
@@ -6389,7 +6406,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kv16_to(kr[d]);
             } else {
                 const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
-                for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+                a+=attn_dot(qr, kr, c->qk_rope);
             }
             sc[jj]=a*c->attn_scale;
         }
@@ -6398,7 +6415,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
             int64_t ti = kvb_map ? (int64_t)kvb_map[t-stL] : (int64_t)t;
             const float *vv=kvb_all+ti*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
-            float a=sc[jj]; for(int d=0;d<vh;d++) cx[d]+=a*vv[d]; }
+            attn_axpy(cx, sc[jj], vv, vh); }
     }
     m->t_acore+=now_s()-tac; double tao=now_s();
     matmul_qt(out, ctx, &l->o, S);
