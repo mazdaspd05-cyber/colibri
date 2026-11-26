@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "hypothesis": "Four AVX2 accumulators on a 512-wide attention dot are faster than one scalar chain, and short lengths stay bit-exact.",
+  "commit": "42d7c60a4aad04e6ee64368229613992aa1752cc",
+  "model": "synthetic n=512 dot, not a checkpoint",
+  "command": "/tmp/bench_attn (200000 dots of 512; tok_s is dots/second)",
+  "prompt_hash": "f03c82bf281445383dfdf8f97f8391390ec6da35201ae0f25e29ac43a23bbd28",
+  "hardware": {
+    "cpu": "Intel Xeon (KVM), 4 vCPU, AVX2+AVX-512",
+    "ram": "15 GiB, 1 NUMA node",
+    "storage": "not on the timed path",
+    "os": "Linux 6.12.113+, gcc 13.3.0 -O3 -march=native"
+  },
+  "warmup_runs": 0,
+  "changed_variables": ["attn_dot"],
+  "baseline": {
+    "config": {"attn_dot": "scalar"},
+    "samples": {"tok_s": [2277904.328018223, 2398081.5347721823, 2285714.285714286]},
+    "median_tok_s": 2285714.285714286,
+    "quality": {"method": "test_attn_dot n<64 bit-exact; n=192 within 1e-5 of double", "passed": true},
+    "evidence": {"uri": "docs/experiments/attn-dot-2026-11-26/raw.txt", "sha256": "ceca5a84ebeacda9a8c16528fb550a281d81c3b201ecec24cc144c289213e777"}
+  },
+  "trial": {
+    "config": {"attn_dot": "avx2-4acc"},
+    "samples": {"tok_s": [27777777.77777778, 27397260.2739726, 27777777.77777778]},
+    "median_tok_s": 27777777.77777778,
+    "quality": {"method": "test_attn_dot n<64 bit-exact; axpy matches fmaf per element", "passed": true},
+    "evidence": {"uri": "docs/experiments/attn-dot-2026-11-26/raw.txt", "sha256": "ceca5a84ebeacda9a8c16528fb550a281d81c3b201ecec24cc144c289213e777"}
+  },
+  "outcome": "improvement"
+}
