@@ -62,6 +62,7 @@
 #include <cpuid.h>                                /* hwinfo_emit: CPU brand string senza /proc */
 #endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
+#include "affinity.h"    /* re-exec keeps taskset/systemd pins; COLI_CPUS overrides */
 #include "cli_args.h"
 #include "oracle.h"
 #define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
@@ -14234,6 +14235,16 @@ int main(int argc, char **argv){
      * perdeva silenziosamente il tuning che un `./colibri` nudo riceve. Grazie a
      * @fredchu per averlo letto nel sorgente e detto chiaramente di non averlo
      * misurato (#707). */
+    /* Snapshot the bind the user exported BEFORE the setenv below. libgomp has
+     * already constructed, so a pre-set OMP_PROC_BIND/OMP_PLACES has narrowed
+     * THIS thread to place 0; a mask that is only taskset or systemd
+     * CPUAffinity has not. getenv's pointer would not survive setenv, the flag
+     * does. */
+    int user_omp_bind = (getenv("OMP_PROC_BIND") && getenv("OMP_PROC_BIND")[0])
+                     || (getenv("OMP_PLACES") && getenv("OMP_PLACES")[0]);
+#if !defined(__linux__) || !defined(CPU_SETSIZE)
+    (void)user_omp_bind;
+#endif
     if(!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE") &&
        !coli_env_on("COLI_CUDA") && !coli_env_on("COLI_METAL")){
         /* #707: the spin-wait knobs are measured HARMFUL on macOS / Apple
@@ -14280,24 +14291,20 @@ int main(int argc, char **argv){
         setenv("COLI_OMP_TUNED","1",1);
 #ifdef __linux__
         fprintf(stderr,"[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n");
-        /* #471: execv PRESERVES the CPU affinity mask. If the user exported
-         * OMP_PROC_BIND/OMP_PLACES, libgomp's constructor already bound THIS thread to
-         * place 0 (one core's SMT siblings) before main() ran; the re-exec'd image would
-         * inherit that 1-core mask, enumerate OMP_PLACES=cores inside it, and jail the
-         * whole team on one core (measured ~20x slowdown). Reset to all online CPUs so
-         * the fresh libgomp binds from the full set — the user's OMP_* env still wins. */
-        /* CPU_SETSIZE is only exposed when _GNU_SOURCE was defined before the first
-         * system header. The standalone engine build defines it at the top of this
-         * file so the reset is active where it matters; test TUs that #include this
-         * file after <assert.h>/<math.h> get it too late, so guard for them (a test
-         * never re-execs — skipping the reset there is harmless). */
+        /* execv keeps this thread's affinity mask. Do not widen a mask the
+         * operator set with taskset or systemd CPUAffinity: that pin is the
+         * whole point, and resetting it to every online CPU dropped it on the
+         * floor. COLI_CPUS=0-3,8 (taskset syntax) is an explicit mask and wins.
+         * The one case that still widens is a process started with
+         * OMP_PROC_BIND or OMP_PLACES already set (#471): libgomp bound THIS
+         * thread to place 0 before main, and the re-exec would jail the team
+         * on that place (~20x). Restoring every online CPU lets the child's
+         * constructor bind from the full set; the user's OMP_* values stay.
+         * CPU_SETSIZE exists only when _GNU_SOURCE preceded the first system
+         * header. This file defines it at the top; a test that includes the
+         * engine after another header skips the call, and a test never re-execs. */
 #ifdef CPU_SETSIZE
-        { cpu_set_t all; CPU_ZERO(&all);
-          long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-          if(ncpu > CPU_SETSIZE) ncpu = CPU_SETSIZE;
-          for(long i = 0; i < ncpu; i++) CPU_SET((int)i, &all);
-          if(sched_setaffinity(0, sizeof(all), &all) != 0)
-              perror("[OMP] sched_setaffinity pre-reexec (continuing)"); }
+        coli_affinity_before_reexec(getenv("COLI_CPUS"), user_omp_bind);
 #endif
         execv("/proc/self/exe", argv);         /* returns only on failure -> fall through and run untuned */
         perror("[OMP] execv self-reexec failed, running untuned");

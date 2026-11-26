@@ -2609,6 +2609,9 @@ tests/test_st$(EXE): tests/test_st.c
 tests/test_willneed_plan$(EXE): tests/test_willneed_plan.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_reexec_affinity$(EXE): tests/test_reexec_affinity.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_st_mirror$(EXE): tests/test_st_mirror.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
