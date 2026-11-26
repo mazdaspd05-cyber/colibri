@@ -332,6 +332,7 @@ static const ColiEnvVar coli_env_table[] = {
     {"COLI_METAL_UNTRACKED",             CE_INT   , CE_ALL                                          , 0             , NULL},
     {"COLI_MIR_STRIPE",                  CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_MMAP",                        CE_INT   , CE_COLIBRI                                      , 0             , NULL},
+    {"COLI_MMAP_IO",                     CE_INT   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_MODEL",                       CE_STR   , CE_COLIBRI                                      , 0             , NULL},
     {"COLI_MODEL_DIRS",                  CE_PATH  , CE_COLIBRI | CE_DSV4 | CE_DSV41, 0             , NULL},
     {"COLI_MODEL_MIRROR",                CE_STR   , CE_COLIBRI | CE_DSV4 | CE_DSV41 | CE_GLM53 | CE_QWEN38, 0, NULL},
